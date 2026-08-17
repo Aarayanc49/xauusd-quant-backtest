@@ -44,3 +44,10 @@ Desktop.ini
 *_journal.jsonl
 .env
 credentials.json
+
+# ── packaged executable ──────────────────────────────────────────────
+# `python build_cockpit.py` regenerates dist/Cockpit.exe (~20 MB) from
+# source. Binaries do not belong in the repo.
+build/
+dist/
+*.spec
