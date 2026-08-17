@@ -21,12 +21,22 @@ Only (4) is the strategy working as designed. The other three are operational
 facts that look identical in a journal that only records fills, and (1) is the
 one that should page you.
 
-## The two modes
+## The four modes
 
     python -m live.explain            # what has it been thinking (journal)
-    python -m live.explain --now      # what is it thinking RIGHT NOW (live)
+    python -m live.explain --now      # gate state RIGHT NOW, per symbol
+    python -m live.explain --setups   # setups on the board + what they target
+    python -m live.explain --zones    # where a setup CAN form, before one does
 
-`--now` is the one that answers the question directly. It connects read-only,
+They answer questions in the order you actually ask them. `--zones` is the
+earliest: a setup here needs a level to break and then be retested, so the
+levels alive right now are the complete set of prices where one can appear —
+nothing triggers anywhere else. `--setups` is the next step, listing the ones
+that have already formed with their entry, stop and target. `--now` says
+whether the gates would let any of them through, and journal mode says what
+happened when they did not.
+
+`--now` connects read-only,
 and for every symbol prints the gate state as it stands this minute — so you
 can see that, say, gold's day-range percentile is 0.42 against a 0.75
 requirement, and therefore **no setup on gold can trade right now no matter how
@@ -53,6 +63,8 @@ import os
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -633,6 +645,148 @@ def report_setups(symbols: list, lookback: int = 400, limit: int = 6):
     b.shutdown()
 
 
+# ── zones mode — where a setup CAN form, before it does ─────────────────────
+
+def live_levels(broker, symbol: str, near: int = 10) -> dict | None:
+    """Every level alive right now, nearest to price first.
+
+    `--setups` is retrospective: it lists setups that have already formed. This
+    is the question that comes before it — *where would one form?* A setup in
+    this system needs a level to break and then be retested, so the levels
+    currently alive are the complete set of places a setup can appear. Nothing
+    can trigger anywhere else.
+
+    Levels come from the same discovery pipeline the trader runs, on the same
+    live series, so these are the exact prices its own next candidate would be
+    built from — not a separate indicator drawn alongside it.
+    """
+    from core import majors as MJ
+    from core.context import Context
+    from core.discover import build_points, level_tracks
+    from live import signals as SIG
+
+    series = SIG.fetch_series(broker, symbol)
+    if series is None:
+        return None
+    bars = series["M5"]
+    ctx = Context(series, base="M5")
+    atr = ctx.scales["M5"].atr
+    pts = build_points(series, ctx, "M5")
+    tr = level_tracks(pts, ctx)
+    if len(tr) == 0:
+        return {"levels": [], "price": float(bars.close[-1]),
+                "atr": float(atr[-1]), "pip": bars.pip}
+
+    i = len(bars) - 1
+    mj = MJ.measure(bars, tr, atr)
+    price = float(bars.close[i])
+    a = float(atr[i])
+    pip = bars.pip
+
+    alive = (tr.born <= i) & (tr.dead > i)
+    rows = []
+    for j in np.nonzero(alive)[0]:
+        lp = float(tr.price[j])
+        d = lp - price
+        t, r = int(mj.touches[j]), int(mj.respects[j])
+        rows.append({
+            "price": lp,
+            "dist_price": d,
+            "dist_atr": d / a if a else 0.0,
+            "dist_pips": d / pip,
+            "above": d > 0,
+            "touches": t, "respects": r,
+            "respect_rate": (r / t) if t else 0.0,
+            "width_pips": float(tr.width[j]) / pip,
+            "age": int(mj.age[j]),
+            "members": int(tr.n_members[j]),
+            "categories": int(mj.categories[j]),
+            "magnet_share": float(tr.magnet_share[j]),
+        })
+    rows.sort(key=lambda x: abs(x["dist_atr"]))
+    return {"levels": rows[:near], "price": price, "atr": a, "pip": pip,
+            "n_alive": int(alive.sum())}
+
+
+def report_zones(symbols: list, near: int = 8):
+    """Where a setup can form on each symbol, before one exists."""
+    from core.contracts import CONTRACTS
+    from live.broker import Broker
+    from live.trader import STOP_ATR, TARGET_R, Trader
+
+    b = Broker()
+    try:
+        acc = b.connect_readonly()
+    except Exception as e:
+        print("Cannot reach MetaTrader 5:", e)
+        return
+    trader = Trader(b, dry_run=True)
+    now = datetime.now(timezone.utc)
+    in_window = TRADE_FROM_HOUR <= now.hour < FLAT_BY_HOUR
+
+    head("LEVELS IN PLAY — where a setup can form")
+    print(f"  {now:%Y-%m-%d %H:%M:%S} UTC   equity ${acc.equity:,.2f}   "
+          f"window {'OPEN' if in_window else 'CLOSED'}")
+    print("  A setup needs one of these levels to BREAK, then be retested.")
+    print("  Nothing can trigger at a price that is not on this list.")
+
+    for sym in symbols:
+        if not b.ensure_symbol(sym):
+            continue
+        try:
+            g = gate_state(b, sym)
+            lv = live_levels(b, sym, near=near)
+        except Exception as e:
+            print(f"\n{sym}: {type(e).__name__}: {e}")
+            continue
+        if lv is None or g is None:
+            print(f"\n{sym}: not enough history")
+            continue
+
+        c = CONTRACTS[sym]
+        d = 2 if c.pip >= 0.01 else 5
+        stop_pips = STOP_ATR * lv["atr"] / lv["pip"]
+        lot, why = trader.size(sym, acc, stop_pips, lv["price"])
+        risk_usd = lot * stop_pips * c.usd_per_pip(lv["price"]) if lot > 0 else 0
+
+        blocked = [v["name"] for v in SWING.verdict(g) if not v["passed"]]
+        head(f"{sym}   {lv['price']:.{d}f}   "
+             f"ATR {lv['atr'] / lv['pip']:.1f}p   {lv['n_alive']} levels alive")
+        if blocked:
+            print(f"  GATES BLOCKED: {', '.join(blocked)}")
+            print(f"  -> a setup at any level below would be REJECTED right now")
+        else:
+            print(f"  GATES ALL OPEN -> a setup at any level below would be TAKEN")
+        print(f"  if one triggers: stop ~{stop_pips:.0f}p, target {TARGET_R:.0f}R "
+              f"~{stop_pips * TARGET_R:.0f}p, {lot:.2f} lots, risk ~${risk_usd:,.0f}")
+
+        if not lv["levels"]:
+            print("  no levels alive — nothing to watch on this symbol")
+            continue
+        print()
+        print(f"  {'dist':>9s} {'price':>11s}  {'side':<6s} {'touch/resp':<13s}"
+              f" {'width':>7s} {'age':>6s}  {'trigger'}")
+        print(f"  {BAR * 9} {BAR * 11}  {BAR * 6} {BAR * 13} {BAR * 7} {BAR * 6}  {BAR * 28}")
+        for r in lv["levels"]:
+            side = "above" if r["above"] else "below"
+            trig = ("break UP -> retest -> BUY" if r["above"]
+                    else "break DOWN -> retest -> SELL")
+            tr_s = f"{r['touches']}/{r['respects']} ({r['respect_rate'] * 100:.0f}%)"
+            star = " *" if abs(r["dist_atr"]) < 0.5 else "  "
+            print(f"  {r['dist_atr']:>+8.2f}A {r['price']:>11.{d}f}{star}"
+                  f"{side:<6s} {tr_s:<13s} {r['width_pips']:>6.1f}p"
+                  f" {r['age']:>5d}b  {trig}")
+        print("  * = within half an ATR of price, the ones that can trigger soonest")
+
+    print()
+    print(BAR * 78)
+    print("  Levels are from the trader's own discovery pipeline on the same")
+    print("  live series, so these are the prices its next candidate is built")
+    print("  from. Stop/target/lot are ESTIMATES at the current ATR — the real")
+    print("  stop is structural and is set from the leg the break actually makes.")
+    b.shutdown()
+
+
 # ── cli ─────────────────────────────────────────────────────────────────────
 
 def main(argv=None):
@@ -642,6 +796,10 @@ def main(argv=None):
                     help="connect read-only and show the CURRENT gate state")
     ap.add_argument("--setups", action="store_true",
                     help="every setup on the board, with entry/stop/target")
+    ap.add_argument("--zones", action="store_true",
+                    help="where a setup CAN form: levels alive right now")
+    ap.add_argument("--near", type=int, default=8,
+                    help="--zones: how many nearest levels per symbol")
     ap.add_argument("--watch", type=int, metavar="SEC",
                     help="re-run every SEC seconds until interrupted")
     ap.add_argument("--limit", type=int, default=6,
@@ -654,7 +812,9 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     def once():
-        if a.setups:
+        if a.zones:
+            report_zones(a.symbol or SYMBOLS, near=a.near)
+        elif a.setups:
             report_setups(a.symbol or SYMBOLS, lookback=a.lookback,
                           limit=a.limit)
         elif a.now:
