@@ -687,6 +687,51 @@ def live_levels(broker, symbol: str, near: int = 10,
     price = float(bars.close[i])
     a = float(atr[i])
     pip = bars.pip
+    major = MJ.is_major(mj, min_touches=1)   # the mask features.py actually uses
+
+    # Re-cluster at THIS bar to recover each level's composition. Tracks carry
+    # only decision/magnet counts; the Cluster objects carry `sources`, which is
+    # the audit trail back to what made the level — and "what is this level"
+    # is the question being asked here.
+    from core.cluster import cluster_points
+    prox = ctx.threshold("proximity")
+    cap = ctx.threshold("cluster_width_cap")
+    tol = ctx.threshold("cluster_tolerance")
+    act = pts.near(i, price, float(prox[i]) * reach)
+    clusters = []
+    if len(act):
+        for c in cluster_points(act, float(cap[i]),
+                                dedup=float(tol[i]) * 0.25):
+            srcs = [f"{act.source[m]}({act.tf[m]})" for m in c.members]
+            clusters.append((float(c.price), {
+                "sources": srcs,
+                # _FAMILY is the taxonomy majors.py counts categories with;
+                # deriving families any other way would let this view disagree
+                # with the `categories` column beside it.
+                "families": sorted({MJ._FAMILY.get(str(act.source[m]),
+                                                   str(act.source[m]))
+                                    for m in c.members}),
+                "n_decision": c.n_decision, "n_magnet": c.n_magnet,
+                "magnet_share": c.magnet_share,
+            }))
+
+    def composition(level_price: float, width: float) -> dict:
+        """Nearest cluster to this track, or {} if none is close enough.
+
+        Tracks are stitched from clusterings taken every 12 bars, so a track's
+        price need not appear in a clustering recomputed at the current bar —
+        an exact-key lookup silently loses the composition and the level then
+        reads as "made of ?". Matching on proximity keeps the audit trail.
+        """
+        if not clusters:
+            return {}
+        tolr = max(width, float(cap[i]) * 0.5, a * 0.05)
+        best, gap = None, None
+        for cp, meta in clusters:
+            g = abs(cp - level_price)
+            if gap is None or g < gap:
+                best, gap = meta, g
+        return best if (gap is not None and gap <= tolr) else {}
 
     alive = (tr.born <= i) & (tr.dead > i)
     rows = []
@@ -694,6 +739,7 @@ def live_levels(broker, symbol: str, near: int = 10,
         lp = float(tr.price[j])
         d = lp - price
         t, r = int(mj.touches[j]), int(mj.respects[j])
+        k = composition(lp, float(tr.width[j]))
         rows.append({
             "price": lp,
             "dist_price": d,
@@ -706,11 +752,18 @@ def live_levels(broker, symbol: str, near: int = 10,
             "age": int(mj.age[j]),
             "members": int(tr.n_members[j]),
             "categories": int(mj.categories[j]),
-            "magnet_share": float(tr.magnet_share[j]),
+            "magnet_share": k.get("magnet_share", float(tr.magnet_share[j])),
+            "is_major": bool(major[j]),
+            "tf_rank": int(mj.tf_rank[j]),
+            "sources": k.get("sources", []),
+            "families": k.get("families", []),
+            "n_decision": k.get("n_decision", int(tr.n_decision[j])),
+            "n_magnet": k.get("n_magnet", int(tr.n_magnet[j])),
         })
     rows.sort(key=lambda x: abs(x["dist_atr"]))
     return {"levels": rows[:near], "price": price, "atr": a, "pip": pip,
-            "n_alive": int(alive.sum())}
+            "n_alive": int(alive.sum()),
+            "n_major": int((alive & major).sum())}
 
 
 def report_zones(symbols: list, near: int = 8, reach: float = 6.0):
@@ -771,20 +824,57 @@ def report_zones(symbols: list, near: int = 8, reach: float = 6.0):
         if not lv["levels"]:
             print("  no levels alive — nothing to watch on this symbol")
             continue
+
+        def line(r):
+            """One level, read the way a trader reads it off a chart."""
+            tag = "MAJOR" if r["is_major"] else "minor"
+            tr_s = f"{r['touches']}t/{r['respects']}r" if r["touches"] else "untested"
+            # a track can outlive the points that formed it: the swing gets
+            # broken, the gap fills. The level is still real and still tested,
+            # but its audit trail has expired - say so rather than print "?".
+            made = "+".join(sorted(set(r["families"]))) or "(sources expired)"
+            kind = ("magnet" if r["magnet_share"] > 0.5 else "decision")
+            hold = f"{r['respect_rate'] * 100:.0f}%" if r["touches"] else "  -"
+            return (f"  {r['price']:>11.{d}f}  {r['dist_atr']:>+6.1f}A "
+                    f"{r['dist_pips']:>+8.0f}p  {tag:<5s} {tr_s:<8s}"
+                    f" {hold:>4s}  {kind:<8s} {made}")
+
+        above = [r for r in lv["levels"] if r["above"]]
+        below = [r for r in lv["levels"] if not r["above"]]
+        above.sort(key=lambda x: x["dist_atr"], reverse=True)
+        below.sort(key=lambda x: x["dist_atr"], reverse=True)
+
         print()
-        print(f"  {'dist':>9s} {'price':>11s}  {'side':<6s} {'touch/resp':<13s}"
-              f" {'width':>7s} {'age':>6s}  {'trigger'}")
-        print(f"  {BAR * 9} {BAR * 11}  {BAR * 6} {BAR * 13} {BAR * 7} {BAR * 6}  {BAR * 28}")
-        for r in lv["levels"]:
-            side = "above" if r["above"] else "below"
-            trig = ("break UP -> retest -> BUY" if r["above"]
-                    else "break DOWN -> retest -> SELL")
-            tr_s = f"{r['touches']}/{r['respects']} ({r['respect_rate'] * 100:.0f}%)"
-            star = " *" if abs(r["dist_atr"]) < 0.5 else "  "
-            print(f"  {r['dist_atr']:>+8.2f}A {r['price']:>11.{d}f}{star}"
-                  f"{side:<6s} {tr_s:<13s} {r['width_pips']:>6.1f}p"
-                  f" {r['age']:>5d}b  {trig}")
-        print("  * = within half an ATR of price, the ones that can trigger soonest")
+        print(f"  {'price':>11s}  {'dist':>6s} {'':>8s}  {'grade':<5s} "
+              f"{'tested':<8s} {'hold':>4s}  {'type':<8s} made of")
+        print(f"  {BAR * 11}  {BAR * 6} {BAR * 8}  {BAR * 5} {BAR * 8} "
+              f"{BAR * 4}  {BAR * 8} {BAR * 24}")
+        for r in above:
+            print(line(r))
+        print(f"  {'>>> ' + format(lv['price'], '.' + str(d) + 'f'):>11s}"
+              f"  {'':>6s} {'':>8s}  <<< PRICE IS HERE")
+        for r in below:
+            print(line(r))
+
+        # the two that matter — nearest MAJOR level each side
+        up = min((r for r in above if r["is_major"]),
+                 key=lambda x: x["dist_atr"], default=None)
+        dn = max((r for r in below if r["is_major"]),
+                 key=lambda x: x["dist_atr"], default=None)
+        print()
+        print("  WHAT TO WATCH")
+        for r, way in ((up, "UP"), (dn, "DOWN")):
+            if r is None:
+                print(f"    {way:<4s} no major level in range")
+                continue
+            side = "BUY" if way == "UP" else "SELL"
+            print(f"    {way:<4s} {r['price']:.{d}f}"
+                  f"  ({abs(r['dist_pips']):.0f}p away, {abs(r['dist_atr']):.1f} ATR)")
+            print(f"         {r['touches']} tests, {r['respect_rate'] * 100:.0f}% held"
+                  f"   built from "
+                  f"{', '.join(r['sources'][:5]) or 'sources expired, level still tracked'}")
+            print(f"         needs: close through it -> impulse leg -> retrace"
+                  f" into 0.5-0.618 -> {side}")
 
     print()
     print(BAR * 78)
