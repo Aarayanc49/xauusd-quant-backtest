@@ -75,6 +75,33 @@ class Broker:
         self.info = acc
         return acc
 
+    def connect_readonly(self):
+        """Attach to the terminal for READING only — no order path is used.
+
+        `connect` refuses a non-demo account and a terminal with algo trading
+        switched off, because it is the entry point for code that places
+        orders. Both checks are wrong for an observer: `live/explain.py` needs
+        to read bars and account state from whatever account is loaded, and
+        refusing to *explain* a live account is the opposite of safe — it hides
+        the reasoning exactly where it matters most.
+
+        Nothing reachable from here can send an order. Anything that places one
+        must go through `connect`.
+        """
+        mt5 = self.mt5
+        if not mt5.initialize():
+            raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+        acc = mt5.account_info()
+        if acc is None:
+            raise RuntimeError("no account info — is the terminal logged in?")
+        global TF
+        TF = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
+              "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
+              "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
+              "D1": mt5.TIMEFRAME_D1}
+        self.info = acc
+        return acc
+
     def shutdown(self):
         self.mt5.shutdown()
 

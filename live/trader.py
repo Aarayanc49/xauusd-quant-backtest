@@ -48,6 +48,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.contracts import CONTRACTS, stepped_caps  # noqa: E402
+from core.strategy import SWING  # noqa: E402
 from live import signals as SIG  # noqa: E402
 from live.broker import Broker  # noqa: E402
 
@@ -88,6 +89,25 @@ class Trader:
         self.day_start_balance = None
         self.day_locked = False
         self.start_balance = broker.account().balance
+        self._state = None         # last journalled loop state, for _note
+
+    def _note(self, state: str, **extra):
+        """Journal a loop state, but only when it CHANGES.
+
+        Every `return` in `pass_once` used to be silent, so a loop that spent
+        six hours outside its trading window and a loop that had crashed wrote
+        exactly the same thing: nothing. That is the single hardest failure to
+        notice, because the expected output of a quiet day is also nothing.
+
+        Logging it on every pass would bury the signals under thousands of
+        heartbeat lines, so only transitions are written. The journal then reads
+        as a state timeline — `window_closed` at 21:00, `scanning` at 07:00 —
+        and a gap in it means the process itself stopped.
+        """
+        if state == self._state:
+            return
+        self._state = state
+        log({"ev": "state", "state": state, **extra})
 
     # ── risk gates ──────────────────────────────────────────────────────────
 
@@ -184,18 +204,25 @@ class Trader:
 
         now = utcnow()
         if not (TRADE_FROM_HOUR <= now.hour < FLAT_BY_HOUR):
+            self._note("window_closed", hour=now.hour,
+                       opens=TRADE_FROM_HOUR, closes=FLAT_BY_HOUR)
             return
         if self._daily_locked(acc):
+            self._note("daily_locked", equity=round(acc.equity, 2),
+                       day_start=round(self.day_start_balance or 0, 2))
             return
 
         open_pos = self.b.positions()
         if len(open_pos) >= MAX_CONCURRENT:
+            self._note("max_concurrent", open=len(open_pos),
+                       cap=MAX_CONCURRENT)
             return
         margin_pct = self._margin_used_pct(acc)
         if margin_pct >= MAX_MARGIN_PCT:
-            log({"ev": "skip_all", "why": "margin_ceiling",
-                 "margin_pct": round(margin_pct, 1)})
+            self._note("margin_ceiling", margin_pct=round(margin_pct, 1),
+                       cap=MAX_MARGIN_PCT)
             return
+        self._note("scanning", symbols=len(SYMBOLS))
 
         by_symbol = {}
         for p in open_pos:
@@ -216,8 +243,17 @@ class Trader:
                     continue
                 self.seen.add(key)
                 if not s["passes"]:
+                    # name the filters that actually blocked it, and by how
+                    # much. "why: filters" forced the reader to redo four
+                    # comparisons by hand to learn anything from the line.
+                    blocked = [{"f": v["name"], "v": v["value"],
+                                "miss": (None if v["margin"] is None
+                                         else round(v["margin"], 4))}
+                               for v in SWING.verdict(s) if not v["passed"]]
                     log({"ev": "signal", "symbol": sym, "taken": False,
                          "why": "filters", "direction": s["direction"],
+                         "blocked_by": [b["f"] for b in blocked],
+                         "blocked": blocked,
                          "range_pct": round(s["range_pct"], 3),
                          "spread_pct": round(s["spread_pct"], 3),
                          "h4_pullback": round(s["h4_pullback"], 3),

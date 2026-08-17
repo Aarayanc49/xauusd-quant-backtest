@@ -60,6 +60,27 @@ TRAIL = None            # measured last in every cost regime; the exit is "don't
 
 SESSIONS_OK = ("london", "ny", "overlap")
 
+_OPS = (">=", "<=", "==", ">", "<")
+
+
+def _parse_filter(name: str) -> tuple:
+    """Pull (field, operator, threshold) back out of a filter's own name.
+
+    The filter names below are written as the comparison they perform
+    (`"range_pct >= 0.75"`), so the name is already the machine-readable form
+    and does not need a second table kept in sync with it. A name that is not a
+    numeric comparison — `"session london/ny/ovlp"` — returns its field with no
+    threshold, and `Spec.verdict` then reports pass/fail without a margin.
+    """
+    for op in _OPS:
+        if op in name:
+            left, _, right = name.partition(op)
+            try:
+                return left.strip(), op, float(right.strip())
+            except ValueError:
+                return left.strip(), op, None
+    return name.split()[0] if name.split() else None, None, None
+
 
 @dataclass(frozen=True)
 class Spec:
@@ -81,6 +102,55 @@ class Spec:
 
     def passes(self, row: Mapping) -> bool:
         return all(fn(row) for fn in self.filters.values())
+
+    def verdict(self, row: Mapping) -> list[dict]:
+        """Per-filter pass/fail for ONE candidate, with how far off it was.
+
+        `passes` answers "did it trade". This answers "why not", which is the
+        question a live run actually raises: a journal line saying `filters`
+        forces the reader to recompute four comparisons by hand, and nobody
+        does that at 3am. Each entry carries
+
+            name      the filter as written below
+            key       the row field it reads
+            value     what that field actually was
+            passed    bool
+            margin    signed distance to the threshold in the field's own
+                      units, positive when passing. None when the filter is
+                      not a numeric comparison.
+
+        `margin` is the reason this exists rather than a bare bool: a candidate
+        that missed by 0.004 and one that missed by 0.6 are different events,
+        and only the first one means "the config is nearly firing here".
+        """
+        out = []
+        for name, fn in self.filters.items():
+            try:
+                passed = bool(fn(row))
+            except (KeyError, TypeError):
+                out.append({"name": name, "key": None, "value": None,
+                            "passed": False, "margin": None,
+                            "error": "field missing"})
+                continue
+            key, op, thr = _parse_filter(name)
+            value = row.get(key) if key else None
+            margin = None
+            if thr is not None and isinstance(value, (int, float)):
+                # signed so positive always means "clear of the threshold",
+                # whichever direction the comparison runs
+                if op in (">=", ">"):
+                    margin = float(value) - thr
+                elif op in ("<=", "<"):
+                    margin = thr - float(value)
+                elif op == "==":
+                    margin = 0.0 if passed else float(value) - thr
+            out.append({"name": name, "key": key, "value": value,
+                        "passed": passed, "margin": margin})
+        return out
+
+    def blocked_by(self, row: Mapping) -> list[str]:
+        """Names of the filters this candidate failed. Empty means it traded."""
+        return [v["name"] for v in self.verdict(row) if not v["passed"]]
 
     def select(self, rows: Sequence[Mapping]) -> list:
         return [x for x in rows if self.passes(x)]
