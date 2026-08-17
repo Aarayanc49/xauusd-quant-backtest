@@ -514,10 +514,16 @@ def _plan(trader, broker, s, acc):
     tp = price + TARGET_R * dist if is_buy else price - TARGET_R * dist
     lot, reason = trader.size(sym, acc, stop_pips, price)
     risk_usd = lot * stop_pips * c.usd_per_pip(price) if lot > 0 else 0.0
+    # Entry is the LIVE tick, so a plan for an old setup is a hybrid: a
+    # structural stop measured at the setup's own bar, against a price from
+    # now. That is the correct number for a setup forming this minute and a
+    # misleading one for a setup from this morning, so the age is carried
+    # alongside and the caller marks it.
     return {"price": price, "sl": sl, "tp": tp, "stop_pips": stop_pips,
             "target_pips": stop_pips * TARGET_R, "lot": lot,
             "size_reason": reason, "risk_usd": risk_usd,
-            "reward_usd": risk_usd * TARGET_R, "pip": c.pip}
+            "reward_usd": risk_usd * TARGET_R, "pip": c.pip,
+            "priced_at": "live tick"}
 
 
 def _server_offset_hours(broker, symbol: str) -> float:
@@ -580,7 +586,7 @@ def report_setups(symbols: list, lookback: int = 400, limit: int = 6):
             total += 1
             blocked = SWING.blocked_by(s)
             p = _plan(trader, b, s, acc)
-            age = ""
+            age, mins = "", None
             try:
                 bt = datetime.fromisoformat(str(s["ts"])).replace(
                     tzinfo=timezone.utc)
@@ -588,6 +594,10 @@ def report_setups(symbols: list, lookback: int = 400, limit: int = 6):
                 age = f"{mins/60:.1f}h ago" if mins > 90 else f"{mins:.0f}m ago"
             except (ValueError, KeyError):
                 pass
+            # The plan's entry is the LIVE tick. For a setup that formed hours
+            # ago that is not the trade that was available then, and reading it
+            # as one is the easiest mistake this view invites.
+            stale = mins is not None and mins > 30
 
             verdict = "WOULD FIRE" if not blocked else "rejected"
             if not blocked:
@@ -598,9 +608,10 @@ def report_setups(symbols: list, lookback: int = 400, limit: int = 6):
             if p:
                 d = 2 if p["pip"] >= 0.01 else 5
                 rr = TARGET_R
+                note = "  <- priced at the LIVE tick, not this bar" if stale else ""
                 print(f"    entry   {p['price']:.{d}f}"
                       f"    stop {p['sl']:.{d}f}"
-                      f"    target {p['tp']:.{d}f}   ({rr:.0f}R)")
+                      f"    target {p['tp']:.{d}f}   ({rr:.0f}R){note}")
                 print(f"    risk    {p['stop_pips']:.1f} pips"
                       f"    ->  target {p['target_pips']:.1f} pips")
                 if p["lot"] > 0:
