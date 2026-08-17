@@ -477,6 +477,162 @@ def report_now(symbols: list, lookback: int = 300):
     b.shutdown()
 
 
+# ── setups mode ─────────────────────────────────────────────────────────────
+
+def _plan(trader, broker, s, acc):
+    """Entry / stop / target / size for one candidate, priced right now.
+
+    Deliberately calls the SAME `Trader.size` the live loop calls rather than
+    reimplementing the arithmetic. A monitor that computes its own lot is a
+    monitor that can disagree with the thing it is monitoring, which is the
+    exact failure the research-vs-live split in this project exists to avoid.
+    """
+    from core.contracts import CONTRACTS
+    from live.trader import TARGET_R
+    sym = s["symbol"]
+    is_buy = s["direction"] == "buy"
+    c = CONTRACTS[sym]
+    tick = broker.tick(sym)
+    if tick is None:
+        return None
+    price = tick.ask if is_buy else tick.bid
+    stop_pips = float(s["risk_pips"])
+    dist = stop_pips * c.pip
+    sl = price - dist if is_buy else price + dist
+    tp = price + TARGET_R * dist if is_buy else price - TARGET_R * dist
+    lot, reason = trader.size(sym, acc, stop_pips, price)
+    risk_usd = lot * stop_pips * c.usd_per_pip(price) if lot > 0 else 0.0
+    return {"price": price, "sl": sl, "tp": tp, "stop_pips": stop_pips,
+            "target_pips": stop_pips * TARGET_R, "lot": lot,
+            "size_reason": reason, "risk_usd": risk_usd,
+            "reward_usd": risk_usd * TARGET_R, "pip": c.pip}
+
+
+def _server_offset_hours(broker, symbol: str) -> float:
+    """Hours the broker's clock runs ahead of UTC, measured not assumed.
+
+    MT5 stamps bars in SERVER time and exposes no timezone for it. Most gold
+    brokers run UTC+2/+3, so subtracting a bar stamp from a UTC clock produces
+    a negative age and a setup from 25 minutes ago reads as "-25m ago".
+
+    The newest CLOSED bar is by definition between one and two bar-widths old,
+    so the difference between its stamp and now, rounded to the nearest hour,
+    is the offset. Measuring it beats hard-coding +3: it follows the broker
+    across DST, and if a terminal ever reports true UTC this returns 0 and
+    nothing changes.
+    """
+    r = broker.bars(symbol, "M5", 2)
+    if r is None or len(r) == 0:
+        return 0.0
+    newest = float(r[-1]["time"])
+    now = datetime.now(timezone.utc).timestamp()
+    return round((newest - now) / 3600.0)
+
+
+def report_setups(symbols: list, lookback: int = 400, limit: int = 6):
+    """Every setup the engine currently sees, with what each one targets."""
+    from live.broker import Broker
+    from live import signals as SIG
+    from live.trader import TARGET_R, Trader
+
+    b = Broker()
+    try:
+        acc = b.connect_readonly()
+    except Exception as e:
+        print("Cannot reach MetaTrader 5:", e)
+        return
+    trader = Trader(b, dry_run=True)
+
+    now = datetime.now(timezone.utc)
+    in_window = TRADE_FROM_HOUR <= now.hour < FLAT_BY_HOUR
+    head("SETUPS ON THE BOARD")
+    print(f"  {now:%Y-%m-%d %H:%M:%S} UTC   equity ${acc.equity:,.2f}   "
+          f"window {'OPEN' if in_window else 'CLOSED'}   target {TARGET_R:.0f}R")
+
+    total = live_n = 0
+    for sym in symbols:
+        if not b.ensure_symbol(sym):
+            continue
+        try:
+            sigs = SIG.scan(b, sym, lookback_bars=lookback)
+        except Exception as e:
+            print(f"\n{sym}: scan failed — {type(e).__name__}: {e}")
+            continue
+        if not sigs:
+            continue
+        offset_h = _server_offset_hours(b, sym)
+        sigs = sorted(sigs, key=lambda x: str(x.get("ts", "")))[-limit:]
+        off = f"   (bar stamps are broker time, UTC{offset_h:+.0f})" if offset_h else ""
+        head(f"{sym}   —   {len(sigs)} setup(s){off}")
+        for s in sigs:
+            total += 1
+            blocked = SWING.blocked_by(s)
+            p = _plan(trader, b, s, acc)
+            age = ""
+            try:
+                bt = datetime.fromisoformat(str(s["ts"])).replace(
+                    tzinfo=timezone.utc)
+                mins = (now - bt).total_seconds() / 60 + offset_h * 60
+                age = f"{mins/60:.1f}h ago" if mins > 90 else f"{mins:.0f}m ago"
+            except (ValueError, KeyError):
+                pass
+
+            verdict = "WOULD FIRE" if not blocked else "rejected"
+            if not blocked:
+                live_n += 1
+            print(f"\n  {s['direction'].upper():<5s} {s['kind'].upper():<6s} "
+                  f"{str(s['ts'])[:16].replace('T', ' ')}  {age:<9s} -> {verdict}")
+
+            if p:
+                d = 2 if p["pip"] >= 0.01 else 5
+                rr = TARGET_R
+                print(f"    entry   {p['price']:.{d}f}"
+                      f"    stop {p['sl']:.{d}f}"
+                      f"    target {p['tp']:.{d}f}   ({rr:.0f}R)")
+                print(f"    risk    {p['stop_pips']:.1f} pips"
+                      f"    ->  target {p['target_pips']:.1f} pips")
+                if p["lot"] > 0:
+                    print(f"    size    {p['lot']:.2f} lots ({p['size_reason']})"
+                          f"   risking ${p['risk_usd']:,.2f}"
+                          f"   to make ${p['reward_usd']:,.2f}")
+                else:
+                    print(f"    size    NO POSITION — {p['size_reason']}")
+
+            print(f"    level   {s['touches']} touches / {s['respects']} respects"
+                  f" ({s['respect_rate']*100:.0f}%)   age {s['level_age']} bars"
+                  f"   {s['n_members']} member(s)")
+            pats = ", ".join(s.get("patterns") or []) or "none"
+            print(f"    leg     {s['leg_atr']:.2f} ATR   pullback {s['pullback_bars']} bars"
+                  f"   patterns: {pats}")
+            print(f"    htf     H4 {s['h4_dir']:+d}  H1 {s['h1_dir']:+d}"
+                  f"  stack {s['htf_stack']}   h4_pullback {s['h4_pullback']:.2f}")
+
+            gates = " | ".join(
+                f"{v['name'].split()[0]} {fmt_val(v['value'])} "
+                f"{'ok' if v['passed'] else 'FAIL'}" for v in SWING.verdict(s))
+            print(f"    gates   {gates}")
+            if blocked:
+                misses = [f"{v['name']} (miss {v['margin']:+.3f})"
+                          if v["margin"] is not None else v["name"]
+                          for v in SWING.verdict(s) if not v["passed"]]
+                print(f"    BLOCKED {'; '.join(misses)}")
+
+            # what actually happened after — hindsight, not a forecast
+            if s.get("outcome") and s.get("mfe_r") is not None:
+                print(f"    since   MFE {s['mfe_r']:+.2f}R  MAE {s['mae_r']:+.2f}R"
+                      f"  -> {s['outcome']} at {s['r']:+.2f}R"
+                      f" ({s['exit_reason']}, 1h sim)")
+
+    print()
+    print(BAR * 78)
+    print(f"  {total} setup(s) on the board, {live_n} passing every gate.")
+    if not in_window:
+        print("  Trading window is CLOSED — none of these can be taken now.")
+    print("  'since' is HINDSIGHT from bars that have already printed, on a")
+    print("  1-hour simulated hold. It is not a forecast for the live target.")
+    b.shutdown()
+
+
 # ── cli ─────────────────────────────────────────────────────────────────────
 
 def main(argv=None):
@@ -484,6 +640,12 @@ def main(argv=None):
         description="Explain what the live trader is thinking.")
     ap.add_argument("--now", action="store_true",
                     help="connect read-only and show the CURRENT gate state")
+    ap.add_argument("--setups", action="store_true",
+                    help="every setup on the board, with entry/stop/target")
+    ap.add_argument("--watch", type=int, metavar="SEC",
+                    help="re-run every SEC seconds until interrupted")
+    ap.add_argument("--limit", type=int, default=6,
+                    help="--setups: most recent N setups per symbol")
     ap.add_argument("--symbol", action="append",
                     help="restrict to one symbol (repeatable)")
     ap.add_argument("--day", help="journal mode: only this UTC day, YYYY-MM-DD")
@@ -491,15 +653,36 @@ def main(argv=None):
                     help="--now: how many M5 bars to scan for candidates")
     a = ap.parse_args(argv)
 
-    if a.now:
-        report_now(a.symbol or SYMBOLS, lookback=a.lookback)
-    else:
-        rows = load()
-        if a.symbol:
-            keep = set(a.symbol)
-            rows = [r for r in rows
-                    if r.get("symbol") in keep or "symbol" not in r]
-        report_journal(rows, day=a.day)
+    def once():
+        if a.setups:
+            report_setups(a.symbol or SYMBOLS, lookback=a.lookback,
+                          limit=a.limit)
+        elif a.now:
+            report_now(a.symbol or SYMBOLS, lookback=a.lookback)
+        else:
+            rows = load()
+            if a.symbol:
+                keep = set(a.symbol)
+                rows = [r for r in rows
+                        if r.get("symbol") in keep or "symbol" not in r]
+            report_journal(rows, day=a.day)
+
+    if not a.watch:
+        once()
+        return 0
+
+    import time
+    try:
+        while True:
+            # scroll rather than clear: the point of watching is to see what
+            # CHANGED, and a screen wipe destroys exactly that.
+            print("\n" + "=" * 78)
+            print(f"= refresh {datetime.now(timezone.utc):%H:%M:%S} UTC")
+            print("=" * 78)
+            once()
+            time.sleep(max(5, a.watch))
+    except KeyboardInterrupt:
+        print("\nstopped.")
     return 0
 
 
