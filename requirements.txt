@@ -1,0 +1,10 @@
+# Core — everything in core/ and research/ runs on these alone.
+numpy>=1.24
+
+# Testing
+pytest>=7.0
+
+# Broker connectivity — Windows only, imported lazily.
+# Required only for `research.fetch mt5` and the live/ package; every study
+# runs against an already-populated store without it.
+MetaTrader5>=5.0.45 ; platform_system == "Windows"
