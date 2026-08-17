@@ -276,6 +276,28 @@ Stated plainly, because the alternative is someone discovering them later:
 
 ---
 
+## The lineage
+
+Three iterations, each built to fix what measuring the previous one exposed. This
+repository is the third.
+
+| | Project | What it established |
+|---|---|---|
+| **v1** | [Gold MT5 Bot](https://github.com/Aarayanc49/gold-mt5-bot-v1) | z-score mean reversion on MT5. A fixed 2-unit stop sat inside gold's noise — **98.3% of 3,440 exits were stop-outs**. Fixed thresholds do not survive a changing volatility regime. |
+| **v2** | [Trading Copilot](https://github.com/Aarayanc49/trading-copilot-v2) | 57K lines, 176 modules, a 14-year backtest driving the production stack itself. Proved the strategy structurally unprofitable at −0.22R/trade, and that **every engineered feature scored \|ρ\| < 0.10** against outcome. |
+| **v3** | **XAUUSD Quant Backtest** *(this repo)* | Full rebuild on v2's findings. Every threshold ATR-scaled, a vectorized engine at **9,736 bars/sec (~800× faster)**, three-way validation split, random-entry control, levels as prices rather than regions. |
+
+What v1 and v2 contributed directly to the design rules above: rule 2 (no fixed-pip
+constant) is v1's stop failure and v2's self-inflicted "regime signal"; rule 7 (the
+exit is the strategy) is v2's trail-step decomposition; rules 1, 3 and 4 are v2's
+238.6-point clusters. The post-mortem in [docs/DESIGN.md](docs/DESIGN.md) is written
+against v2's tree specifically.
+
+None of the three found a durable edge. Each one narrowed down why, and the
+measurement apparatus outlived the strategy every time.
+
+---
+
 ## Disclaimer
 
 This is research code published as a portfolio piece. All rights reserved.
