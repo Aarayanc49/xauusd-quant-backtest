@@ -647,7 +647,8 @@ def report_setups(symbols: list, lookback: int = 400, limit: int = 6):
 
 # ── zones mode — where a setup CAN form, before it does ─────────────────────
 
-def live_levels(broker, symbol: str, near: int = 10) -> dict | None:
+def live_levels(broker, symbol: str, near: int = 10,
+                reach: float = 6.0) -> dict | None:
     """Every level alive right now, nearest to price first.
 
     `--setups` is retrospective: it lists setups that have already formed. This
@@ -672,7 +673,11 @@ def live_levels(broker, symbol: str, near: int = 10) -> dict | None:
     ctx = Context(series, base="M5")
     atr = ctx.scales["M5"].atr
     pts = build_points(series, ctx, "M5")
-    tr = level_tracks(pts, ctx)
+    # reach_mult bounds how far from price discovery bothers clustering.
+    # The default of 6 keeps the trader fast, but it means distant levels
+    # are absent rather than merely far away, which reads as 'the tool is
+    # missing levels'. Raising it here costs a slower scan and nothing else.
+    tr = level_tracks(pts, ctx, reach_mult=reach)
     if len(tr) == 0:
         return {"levels": [], "price": float(bars.close[-1]),
                 "atr": float(atr[-1]), "pip": bars.pip}
@@ -708,7 +713,7 @@ def live_levels(broker, symbol: str, near: int = 10) -> dict | None:
             "n_alive": int(alive.sum())}
 
 
-def report_zones(symbols: list, near: int = 8):
+def report_zones(symbols: list, near: int = 8, reach: float = 6.0):
     """Where a setup can form on each symbol, before one exists."""
     from core.contracts import CONTRACTS
     from live.broker import Broker
@@ -735,7 +740,7 @@ def report_zones(symbols: list, near: int = 8):
             continue
         try:
             g = gate_state(b, sym)
-            lv = live_levels(b, sym, near=near)
+            lv = live_levels(b, sym, near=near, reach=reach)
         except Exception as e:
             print(f"\n{sym}: {type(e).__name__}: {e}")
             continue
@@ -746,12 +751,15 @@ def report_zones(symbols: list, near: int = 8):
         c = CONTRACTS[sym]
         d = 2 if c.pip >= 0.01 else 5
         stop_pips = STOP_ATR * lv["atr"] / lv["pip"]
-        lot, why = trader.size(sym, acc, stop_pips, lv["price"])
+        lot, _ = trader.size(sym, acc, stop_pips, lv["price"])
         risk_usd = lot * stop_pips * c.usd_per_pip(lv["price"]) if lot > 0 else 0
 
         blocked = [v["name"] for v in SWING.verdict(g) if not v["passed"]]
+        shown, total_alive = len(lv["levels"]), lv["n_alive"]
+        trunc = "" if shown >= total_alive else f", showing {shown} nearest"
         head(f"{sym}   {lv['price']:.{d}f}   "
-             f"ATR {lv['atr'] / lv['pip']:.1f}p   {lv['n_alive']} levels alive")
+             f"ATR {lv['atr'] / lv['pip']:.1f}p   "
+             f"{total_alive} levels alive{trunc}")
         if blocked:
             print(f"  GATES BLOCKED: {', '.join(blocked)}")
             print(f"  -> a setup at any level below would be REJECTED right now")
@@ -784,6 +792,15 @@ def report_zones(symbols: list, near: int = 8):
     print("  live series, so these are the prices its next candidate is built")
     print("  from. Stop/target/lot are ESTIMATES at the current ATR — the real")
     print("  stop is structural and is set from the leg the break actually makes.")
+    print()
+    print(f"  Discovery radius is --reach {reach:g} (the trader's own default is 6).")
+    print("  Raising it does two things, and the second is easy to miss:")
+    print("    * distant levels appear at all")
+    print("    * NEAR levels gain history — a level is only tracked once price")
+    print("      comes within reach, so touch counts are UNDER-reported at a")
+    print("      small radius. The same level can read 3/3 at reach 6 and")
+    print("      20/20 at reach 40.")
+    print("  For the full picture:  --zones --all --reach 40")
     b.shutdown()
 
 
@@ -800,6 +817,11 @@ def main(argv=None):
                     help="where a setup CAN form: levels alive right now")
     ap.add_argument("--near", type=int, default=8,
                     help="--zones: how many nearest levels per symbol")
+    ap.add_argument("--all", action="store_true",
+                    help="--zones: every level alive, not just the nearest")
+    ap.add_argument("--reach", type=float, default=6.0,
+                    help="--zones: discovery radius in proximity units "
+                         "(default 6; raise to find distant levels)")
     ap.add_argument("--watch", type=int, metavar="SEC",
                     help="re-run every SEC seconds until interrupted")
     ap.add_argument("--limit", type=int, default=6,
@@ -813,7 +835,9 @@ def main(argv=None):
 
     def once():
         if a.zones:
-            report_zones(a.symbol or SYMBOLS, near=a.near)
+            report_zones(a.symbol or SYMBOLS,
+                         near=10**6 if a.all else a.near,
+                         reach=a.reach)
         elif a.setups:
             report_setups(a.symbol or SYMBOLS, lookback=a.lookback,
                           limit=a.limit)
